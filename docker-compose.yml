@@ -1,0 +1,59 @@
+# ─────────────────────────────────────────────────────────────
+# docker-compose.yml — docker-radarvirtuel v2
+# Version     : v1.0 — 2026-06-08
+# Description : RadarVirtuel feeder Docker
+#               Beast TCP → radarvirtuel.com:30004
+# ─────────────────────────────────────────────────────────────
+# SETUP:
+#   1. cp .env.example .env
+#   2. nano .env  (renseigner lat/lon et SOURCE_HOST)
+#   3. docker compose up -d
+#   4. docker logs -f radarvirtuel
+# ─────────────────────────────────────────────────────────────
+
+services:
+  radarvirtuel:
+    image: ghcr.io/adsbnetwork/docker-radarvirtuel:latest
+    container_name: radarvirtuel
+    hostname: radarvirtuel
+    restart: unless-stopped
+
+    environment:
+      # ── Position de votre station ──────────────────────────
+      # Obligatoire — 5 à 6 décimales
+      - RV_LAT=${FEEDER_LAT}
+      - RV_LON=${FEEDER_LONG}
+      - RV_ALT_M=${FEEDER_ALT_M:-0}
+
+      # ── Label station (optionnel) ─────────────────────────
+      # Code OACI de l'aéroport le plus proche + suffixe (ex: LFPG1)
+      # Si vide : détecté automatiquement depuis vos coordonnées
+      - RV_STATION_LABEL=${RV_STATION_LABEL:-}
+
+      # ── UID station (optionnel) ───────────────────────────
+      # Laissez vide : généré automatiquement et sauvegardé
+      - RV_STATION_UID=${RV_STATION_UID:-}
+
+      # ── Informations contributeur (optionnel) ─────────────
+      # Affichées sur votre page station radarvirtuel.com/station/LABEL
+      - RV_CONTRIB_NAME=${RV_CONTRIB_NAME:-}
+      - RV_CONTRIB_EMAIL=${RV_CONTRIB_EMAIL:-}
+
+      # ── Source Beast ──────────────────────────────────────
+      # Container dans le même stack : ultrafeeder:30005
+      # readsb/dump1090 sur même machine : ${HOSTNAME}:30005
+      # Machine distante : 192.168.1.10:30005
+      - SOURCE_HOST=${SOURCE_HOST:-${HOSTNAME}:30005}
+
+    volumes:
+      # UID persistant entre mises à jour du container
+      - radarvirtuel_data:/data
+      - "/etc/localtime:/etc/localtime:ro"
+      - "/etc/timezone:/etc/timezone:ro"
+
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,relatime,size=32M
+
+volumes:
+  radarvirtuel_data:
+    driver: local
