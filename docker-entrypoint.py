@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 # ─────────────────────────────────────────────────────────────
 # File        : docker-entrypoint.py
-# Version     : v1.7 — 2026-06-08
+# Version     : v2.0 — 2026-06-08
 # Deploy      : /entrypoint.py (inside Docker image)
-# Description : RadarVirtuel Docker feeder entrypoint
+# Description : RadarVirtuel Docker feeder entrypoint v2.0
 #               1. Station UID — CPU serial host > volume > UUID généré
 #               2. Lat/lon — env vars > /etc/default/mlat-client monté
 #               3. Nearest airport via radarvirtuel.com API
 #               4. Register station via /api/station/register
-#               5. Heartbeat thread — POST /api/station/feed_ping toutes les 60s
-#               6. Launch socat en subprocess (garde le thread heartbeat actif)
-# v1.7 : RV_HOST lu depuis env — IP directe par défaut (bypass Cloudflare)
-# v1.6 : fix — socat lancé en subprocess.Popen au lieu de os.execvp
+#               5. Génère config.json pour feeder_radarvirtuel.py
+#               6. Heartbeat thread — POST /api/station/feed_ping toutes les 60s
+#               7. Lance feeder_radarvirtuel.py en subprocess
+# v2.0 : remplace socat par feeder_radarvirtuel.py — POST /api/feed avec tagging station
 # ─────────────────────────────────────────────────────────────
 
 import os
@@ -28,9 +28,8 @@ import time
 RV_REGISTER  = 'https://radarvirtuel.com/api/station/register'
 RV_FEED_PING = 'https://radarvirtuel.com/api/station/feed_ping'
 UID_FILE     = '/data/station_uid.txt'
-RV_HOST      = os.environ.get('RV_HOST', '65.108.133.247')
-RV_PORT      = '30004'
-UA           = 'Mozilla/5.0 (compatible; RadarVirtuel-feeder/1.7)'
+CONFIG_FILE  = '/opt/feeder_rv/config.json'
+UA           = 'Mozilla/5.0 (compatible; RadarVirtuel-feeder/2.0)'
 
 def log(msg):
     print(f"[RV] {msg}", flush=True)
@@ -54,6 +53,11 @@ def api_post(url, payload_dict, uid):
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode())
 
+# ── Station UID ───────────────────────────────────────────────
+# Priority 1 : RV_STATION_UID env var
+# Priority 2 : CPU serial from host /proc/cpuinfo (mounted as /host/cpuinfo)
+# Priority 3 : persisted UUID in Docker volume /data/station_uid.txt
+# Priority 4 : generate new UUID and persist it
 def get_or_create_uid():
     env_uid = os.environ.get('RV_STATION_UID', '').strip()
     if env_uid and len(env_uid) >= 8:
@@ -80,6 +84,9 @@ def get_or_create_uid():
     log(f"UID generated: {uid} → saved to {UID_FILE}")
     return uid
 
+# ── Coordinates ───────────────────────────────────────────────
+# Priority 1 : RV_LAT / RV_LON env vars
+# Priority 2 : /etc/default/mlat-client monté dans le container
 def get_coords():
     lat = os.environ.get('RV_LAT', '').strip()
     lon = os.environ.get('RV_LON', '').strip()
@@ -100,7 +107,7 @@ def get_coords():
         except Exception:
             pass
     if not lat or not lon:
-        log("ERROR: RV_LAT and RV_LON must be set")
+        log("ERROR: RV_LAT and RV_LON must be set (env vars or mount /etc/default/mlat-client)")
         sys.exit(1)
     try:
         return float(lat), float(lon), float(alt or 0)
@@ -108,6 +115,7 @@ def get_coords():
         log(f"ERROR: Invalid coordinates: lat={lat} lon={lon}")
         sys.exit(1)
 
+# ── Nearest airport ───────────────────────────────────────────
 def get_nearest_airport(lat, lon):
     try:
         data     = api_get(f"https://radarvirtuel.com/api/nearest_airport?lat={lat}&lon={lon}")
@@ -124,6 +132,7 @@ def get_nearest_airport(lat, lon):
         log(f"Warning: nearest_airport API: {e}")
     return None, {}
 
+# ── Station label ─────────────────────────────────────────────
 def get_station_label(suggested_label):
     label = os.environ.get('RV_STATION_LABEL', '').strip().upper()
     if label:
@@ -135,7 +144,20 @@ def get_station_label(suggested_label):
     log(f"Label auto-selected: {suggested_label}")
     return suggested_label
 
-def register_station(uid, label, lat, lon, alt_m):
+# ── Validate contrib info ─────────────────────────────────────
+def get_contrib_info():
+    name  = os.environ.get('RV_CONTRIB_NAME', '').strip()
+    email = os.environ.get('RV_CONTRIB_EMAIL', '').strip()
+    if not name:
+        log("ERROR: RV_CONTRIB_NAME must be set")
+        sys.exit(1)
+    if not email or '@' not in email:
+        log("ERROR: RV_CONTRIB_EMAIL must be set (valid email address)")
+        sys.exit(1)
+    return name, email
+
+# ── Register station ──────────────────────────────────────────
+def register_station(uid, label, lat, lon, alt_m, name, email):
     try:
         resp = api_post(RV_REGISTER, {
             'station_uid':   uid,
@@ -143,8 +165,8 @@ def register_station(uid, label, lat, lon, alt_m):
             'lat':           lat,
             'lon':           lon,
             'alt_m':         alt_m,
-            'contrib_name':  os.environ.get('RV_CONTRIB_NAME', ''),
-            'contrib_email': os.environ.get('RV_CONTRIB_EMAIL', ''),
+            'contrib_name':  name,
+            'contrib_email': email,
             'description':   f"Docker feeder — {label}",
         }, uid)
         status = resp.get('status', '?').upper()
@@ -159,7 +181,44 @@ def register_station(uid, label, lat, lon, alt_m):
         log(f"Registration warning: {e} — continuing")
         return True, label
 
+# ── Generate config.json for feeder_radarvirtuel.py ───────────
+def generate_config(uid, label, lat, lon, alt_m, name, email):
+    aircraft_url = os.environ.get('RV_AIRCRAFT_URL', 'http://localhost/tar1090/data/aircraft.json')
+    interval     = int(os.environ.get('RV_INTERVAL', '5'))
+    config = {
+        "terrain": {
+            "nom":        label,
+            "latitude":   lat,
+            "longitude":  lon,
+            "altitude_m": alt_m,
+            "contrib_name":  name,
+            "contrib_email": email,
+        },
+        "radarvirtuel": {
+            "url":         "https://radarvirtuel.com/api/feed",
+            "station_uid": uid,
+            "enabled":     True,
+            "interval_s":  interval,
+        },
+        "aircraft_sources": [
+            aircraft_url,
+            "http://localhost/tar1090/data/aircraft.json",
+            "http://localhost/dump1090/data/aircraft.json",
+            "http://localhost:8080/data/aircraft.json",
+        ]
+    }
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+    log(f"Config written: {CONFIG_FILE}")
+    log(f"  aircraft_url : {aircraft_url}")
+    log(f"  station_uid  : {uid}")
+    log(f"  label        : {label}")
+    log(f"  contrib      : {name} <{email}>")
+
+# ── Heartbeat thread ──────────────────────────────────────────
 def heartbeat_loop(uid, label, interval=60):
+    """POST /api/station/feed_ping toutes les 60s — maintient le statut ONLINE."""
     log(f"Heartbeat started — ping every {interval}s")
     while True:
         time.sleep(interval)
@@ -172,46 +231,42 @@ def heartbeat_loop(uid, label, interval=60):
         except Exception as e:
             log(f"Heartbeat error: {e}")
 
-def launch_connector(source_host, source_port, label, lat, lon):
-    cmd = [
-        'socat',
-        f'TCP:{source_host}:{source_port},retry=60,interval=5',
-        f'TCP:{RV_HOST}:{RV_PORT},retry=60,interval=5',
-    ]
-    log(f"Launching socat Beast pipe:")
-    log(f"  Source : {source_host}:{source_port}")
-    log(f"  Target : {RV_HOST}:{RV_PORT}")
-    log(f"  Station: {label} lat={lat} lon={lon}")
+# ── Launch feeder_radarvirtuel.py ─────────────────────────────
+def launch_feeder():
+    """Lance feeder_radarvirtuel.py en subprocess avec restart automatique."""
+    cmd = ['python3', '-u', '/opt/feeder_rv/feeder_radarvirtuel.py']
+    log(f"Launching feeder_radarvirtuel.py...")
     log("─" * 50)
     while True:
         proc = subprocess.Popen(cmd)
         ret  = proc.wait()
-        log(f"socat exited (code {ret}) — restarting in 5s")
+        log(f"feeder exited (code {ret}) — restarting in 5s")
         time.sleep(5)
 
+# ── Main ──────────────────────────────────────────────────────
 def main():
     log("=" * 50)
-    log("RadarVirtuel Docker Feeder v1.7 — 2026-06-08")
+    log("RadarVirtuel Docker Feeder v2.0 — 2026-06-08")
     log("=" * 50)
 
     uid             = get_or_create_uid()
     lat, lon, alt_m = get_coords()
-    log(f"Position: lat={lat} lon={lon} alt={alt_m}m")
+    name, email     = get_contrib_info()
+    log(f"Position   : lat={lat} lon={lon} alt={alt_m}m")
+    log(f"Contributor: {name} <{email}>")
 
     suggested, _    = get_nearest_airport(lat, lon)
     label           = get_station_label(suggested)
-    _, label        = register_station(uid, label, lat, lon, alt_m)
+    _, label        = register_station(uid, label, lat, lon, alt_m, name, email)
 
+    generate_config(uid, label, lat, lon, alt_m, name, email)
+
+    # Heartbeat thread daemon
     threading.Thread(
         target=heartbeat_loop, args=(uid, label, 60), daemon=True
     ).start()
 
-    source      = os.environ.get('SOURCE_HOST', 'localhost:30005')
-    parts       = source.rsplit(':', 1)
-    source_host = parts[0]
-    source_port = parts[1] if len(parts) == 2 else '30005'
-
-    launch_connector(source_host, source_port, label, lat, lon)
+    launch_feeder()
 
 if __name__ == '__main__':
     main()

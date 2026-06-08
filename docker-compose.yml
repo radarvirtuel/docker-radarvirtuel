@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────
-# docker-compose.yml — docker-radarvirtuel v2
-# Version     : v1.3 — 2026-06-08
+# docker-compose.yml — docker-radarvirtuel v2.0
+# Version     : v2.0 — 2026-06-08
 # ─────────────────────────────────────────────────────────────
 # SETUP:
 #   1. cp env.example .env && nano .env
@@ -16,27 +16,32 @@ services:
     restart: unless-stopped
 
     environment:
-      # ── Station UID (optionnel) ───────────────────────────
-      # Laissez vide : lu depuis CPU serial ou généré automatiquement
-      - RV_STATION_UID=${RV_STATION_UID:-}
+      # ── Contributeur (OBLIGATOIRE) ────────────────────────
+      - RV_CONTRIB_NAME=${RV_CONTRIB_NAME}
+      - RV_CONTRIB_EMAIL=${RV_CONTRIB_EMAIL}
 
-      # ── Position (obligatoire si mlat-client non monté) ───
-      - RV_LAT=${FEEDER_LAT:-}
-      - RV_LON=${FEEDER_LONG:-}
+      # ── Position (OBLIGATOIRE) ────────────────────────────
+      - RV_LAT=${FEEDER_LAT}
+      - RV_LON=${FEEDER_LONG}
       - RV_ALT_M=${FEEDER_ALT_M:-0}
 
       # ── Label station (optionnel) ─────────────────────────
       # Laissez vide : détecté depuis l'aéroport le plus proche
       - RV_STATION_LABEL=${RV_STATION_LABEL:-}
 
-      # ── Contributeur (optionnel) ──────────────────────────
-      - RV_CONTRIB_NAME=${RV_CONTRIB_NAME:-}
-      - RV_CONTRIB_EMAIL=${RV_CONTRIB_EMAIL:-}
+      # ── UID station (optionnel) ───────────────────────────
+      # Laissez vide : lu depuis CPU serial ou généré automatiquement
+      - RV_STATION_UID=${RV_STATION_UID:-}
 
-      # ── Source Beast ──────────────────────────────────────
-      # ultrafeeder dans le même stack : SOURCE_HOST=ultrafeeder:30005
-      # readsb standalone même machine  : SOURCE_HOST=192.168.1.x:30005
-      - SOURCE_HOST=${SOURCE_HOST:-localhost:30005}
+      # ── Source aircraft.json ──────────────────────────────
+      # URL HTTP vers aircraft.json de votre décodeur local
+      # readsb/tar1090 : http://IP_MACHINE/tar1090/data/aircraft.json
+      # dump1090       : http://IP_MACHINE/dump1090/data/aircraft.json
+      # port 8080      : http://IP_MACHINE:8080/data/aircraft.json
+      - RV_AIRCRAFT_URL=${RV_AIRCRAFT_URL}
+
+      # ── Options ───────────────────────────────────────────
+      - RV_INTERVAL=${RV_INTERVAL:-5}
 
     volumes:
       # UID persistant entre mises à jour
