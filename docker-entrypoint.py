@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ─────────────────────────────────────────────────────────────
 # File        : docker-entrypoint.py
-# Version     : v1.5 — 2026-06-08
+# Version     : v1.6 — 2026-06-08
 # Deploy      : /entrypoint.py (inside Docker image)
 # Description : RadarVirtuel Docker feeder entrypoint
 #               1. Station UID — CPU serial host > volume > UUID généré
@@ -10,8 +10,9 @@
 #               3. Nearest airport via radarvirtuel.com API
 #               4. Register station via /api/station/register
 #               5. Heartbeat thread — POST /api/station/feed_ping toutes les 60s
-#               6. Launch socat Beast pipe → radarvirtuel.com:30004
-# v1.5 : heartbeat thread pour afficher ONLINE même sans trafic
+#               6. Launch socat en subprocess (garde le thread heartbeat actif)
+# v1.6 : fix — socat lancé en subprocess.Popen au lieu de os.execvp
+#              pour que le thread heartbeat reste actif
 # ─────────────────────────────────────────────────────────────
 
 import os
@@ -21,6 +22,7 @@ import uuid
 import urllib.request
 import urllib.error
 import threading
+import subprocess
 import time
 
 RV_REGISTER  = 'https://radarvirtuel.com/api/station/register'
@@ -28,23 +30,20 @@ RV_FEED_PING = 'https://radarvirtuel.com/api/station/feed_ping'
 UID_FILE     = '/data/station_uid.txt'
 RV_HOST      = 'radarvirtuel.com'
 RV_PORT      = '30004'
-UA           = 'Mozilla/5.0 (compatible; RadarVirtuel-feeder/1.5)'
+UA           = 'Mozilla/5.0 (compatible; RadarVirtuel-feeder/1.6)'
 
 def log(msg):
     print(f"[RV] {msg}", flush=True)
 
 def api_get(url):
-    """HTTP GET avec User-Agent navigateur pour passer Cloudflare."""
     req = urllib.request.Request(url, headers={'User-Agent': UA})
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read().decode())
 
 def api_post(url, payload_dict, uid):
-    """HTTP POST JSON avec User-Agent navigateur."""
     payload = json.dumps(payload_dict).encode('utf-8')
     req = urllib.request.Request(
-        url,
-        data=payload,
+        url, data=payload,
         headers={
             'Content-Type':  'application/json',
             'X-Station-UID': uid,
@@ -56,10 +55,6 @@ def api_post(url, payload_dict, uid):
         return json.loads(r.read().decode())
 
 # ── Station UID ───────────────────────────────────────────────
-# Priority 1 : RV_STATION_UID env var
-# Priority 2 : CPU serial from host /proc/cpuinfo (mounted as /host/cpuinfo)
-# Priority 3 : persisted UUID in Docker volume /data/station_uid.txt
-# Priority 4 : generate new UUID and persist it
 def get_or_create_uid():
     env_uid = os.environ.get('RV_STATION_UID', '').strip()
     if env_uid and len(env_uid) >= 8:
@@ -87,8 +82,6 @@ def get_or_create_uid():
     return uid
 
 # ── Coordinates ───────────────────────────────────────────────
-# Priority 1 : RV_LAT / RV_LON env vars
-# Priority 2 : /etc/default/mlat-client monté dans le container
 def get_coords():
     lat = os.environ.get('RV_LAT', '').strip()
     lon = os.environ.get('RV_LON', '').strip()
@@ -109,7 +102,7 @@ def get_coords():
         except Exception:
             pass
     if not lat or not lon:
-        log("ERROR: RV_LAT and RV_LON must be set (env vars or mount /etc/default/mlat-client)")
+        log("ERROR: RV_LAT and RV_LON must be set")
         sys.exit(1)
     try:
         return float(lat), float(lon), float(alt or 0)
@@ -119,10 +112,8 @@ def get_coords():
 
 # ── Nearest airport ───────────────────────────────────────────
 def get_nearest_airport(lat, lon):
-    """API response: {"airports": [{icao_code, name, distance_km, suggested_label}]}"""
     try:
-        url  = f"https://radarvirtuel.com/api/nearest_airport?lat={lat}&lon={lon}"
-        data = api_get(url)
+        data     = api_get(f"https://radarvirtuel.com/api/nearest_airport?lat={lat}&lon={lon}")
         airports = data.get('airports', [])
         if airports:
             first     = airports[0]
@@ -190,7 +181,7 @@ def heartbeat_loop(uid, label, interval=60):
 
 # ── Launch socat Beast pipe ───────────────────────────────────
 def launch_connector(source_host, source_port, label, lat, lon):
-    """socat TCP pipe: SOURCE_HOST:30005 → radarvirtuel.com:30004"""
+    """socat TCP pipe en subprocess — garde le thread heartbeat actif."""
     cmd = [
         'socat',
         f'TCP:{source_host}:{source_port},retry=60,interval=5',
@@ -201,12 +192,18 @@ def launch_connector(source_host, source_port, label, lat, lon):
     log(f"  Target : {RV_HOST}:{RV_PORT}")
     log(f"  Station: {label} lat={lat} lon={lon}")
     log("─" * 50)
-    os.execvp('socat', cmd)
+    # subprocess.Popen — ne remplace pas le process Python
+    # Le thread heartbeat continue de tourner
+    while True:
+        proc = subprocess.Popen(cmd)
+        ret  = proc.wait()
+        log(f"socat exited (code {ret}) — restarting in 5s")
+        time.sleep(5)
 
 # ── Main ──────────────────────────────────────────────────────
 def main():
     log("=" * 50)
-    log("RadarVirtuel Docker Feeder v1.5 — 2026-06-08")
+    log("RadarVirtuel Docker Feeder v1.6 — 2026-06-08")
     log("=" * 50)
 
     uid             = get_or_create_uid()
@@ -217,9 +214,10 @@ def main():
     label           = get_station_label(suggested)
     _, label        = register_station(uid, label, lat, lon, alt_m)
 
-    # Heartbeat thread — daemon pour qu'il s'arrête avec le process principal
-    t = threading.Thread(target=heartbeat_loop, args=(uid, label, 60), daemon=True)
-    t.start()
+    # Heartbeat thread daemon
+    threading.Thread(
+        target=heartbeat_loop, args=(uid, label, 60), daemon=True
+    ).start()
 
     source      = os.environ.get('SOURCE_HOST', 'localhost:30005')
     parts       = source.rsplit(':', 1)
