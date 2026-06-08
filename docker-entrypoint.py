@@ -2,15 +2,16 @@
 # -*- coding: utf-8 -*-
 # ─────────────────────────────────────────────────────────────
 # File        : docker-entrypoint.py
-# Version     : v1.4 — 2026-06-08
+# Version     : v1.5 — 2026-06-08
 # Deploy      : /entrypoint.py (inside Docker image)
 # Description : RadarVirtuel Docker feeder entrypoint
 #               1. Station UID — CPU serial host > volume > UUID généré
 #               2. Lat/lon — env vars > /etc/default/mlat-client monté
 #               3. Nearest airport via radarvirtuel.com API
 #               4. Register station via /api/station/register
-#               5. Launch socat Beast pipe → radarvirtuel.com:30004
-# v1.4 : fix Cloudflare 403 — User-Agent navigateur sur tous les appels API
+#               5. Heartbeat thread — POST /api/station/feed_ping toutes les 60s
+#               6. Launch socat Beast pipe → radarvirtuel.com:30004
+# v1.5 : heartbeat thread pour afficher ONLINE même sans trafic
 # ─────────────────────────────────────────────────────────────
 
 import os
@@ -19,12 +20,15 @@ import json
 import uuid
 import urllib.request
 import urllib.error
+import threading
+import time
 
-RV_REGISTER = 'https://radarvirtuel.com/api/station/register'
-UID_FILE    = '/data/station_uid.txt'
-RV_HOST     = 'radarvirtuel.com'
-RV_PORT     = '30004'
-UA          = 'Mozilla/5.0 (compatible; RadarVirtuel-feeder/1.4)'
+RV_REGISTER  = 'https://radarvirtuel.com/api/station/register'
+RV_FEED_PING = 'https://radarvirtuel.com/api/station/feed_ping'
+UID_FILE     = '/data/station_uid.txt'
+RV_HOST      = 'radarvirtuel.com'
+RV_PORT      = '30004'
+UA           = 'Mozilla/5.0 (compatible; RadarVirtuel-feeder/1.5)'
 
 def log(msg):
     print(f"[RV] {msg}", flush=True)
@@ -169,6 +173,21 @@ def register_station(uid, label, lat, lon, alt_m):
         log(f"Registration warning: {e} — continuing")
         return True, label
 
+# ── Heartbeat thread ──────────────────────────────────────────
+def heartbeat_loop(uid, label, interval=60):
+    """POST /api/station/feed_ping toutes les 60s — maintient le statut ONLINE."""
+    log(f"Heartbeat started — ping every {interval}s")
+    while True:
+        time.sleep(interval)
+        try:
+            resp = api_post(RV_FEED_PING, {'station_uid': uid}, uid)
+            if resp.get('ok'):
+                log(f"Heartbeat OK — station {label}")
+            else:
+                log(f"Heartbeat warning: {resp.get('error','?')}")
+        except Exception as e:
+            log(f"Heartbeat error: {e}")
+
 # ── Launch socat Beast pipe ───────────────────────────────────
 def launch_connector(source_host, source_port, label, lat, lon):
     """socat TCP pipe: SOURCE_HOST:30005 → radarvirtuel.com:30004"""
@@ -187,7 +206,7 @@ def launch_connector(source_host, source_port, label, lat, lon):
 # ── Main ──────────────────────────────────────────────────────
 def main():
     log("=" * 50)
-    log("RadarVirtuel Docker Feeder v1.4 — 2026-06-08")
+    log("RadarVirtuel Docker Feeder v1.5 — 2026-06-08")
     log("=" * 50)
 
     uid             = get_or_create_uid()
@@ -197,6 +216,10 @@ def main():
     suggested, _    = get_nearest_airport(lat, lon)
     label           = get_station_label(suggested)
     _, label        = register_station(uid, label, lat, lon, alt_m)
+
+    # Heartbeat thread — daemon pour qu'il s'arrête avec le process principal
+    t = threading.Thread(target=heartbeat_loop, args=(uid, label, 60), daemon=True)
+    t.start()
 
     source      = os.environ.get('SOURCE_HOST', 'localhost:30005')
     parts       = source.rsplit(':', 1)
