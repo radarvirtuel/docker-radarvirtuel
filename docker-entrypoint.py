@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ─────────────────────────────────────────────────────────────
 # File        : docker-entrypoint.py
-# Version     : v1.3 — 2026-06-08
+# Version     : v1.4 — 2026-06-08
 # Deploy      : /entrypoint.py (inside Docker image)
 # Description : RadarVirtuel Docker feeder entrypoint
 #               1. Station UID — CPU serial host > volume > UUID généré
@@ -10,6 +10,7 @@
 #               3. Nearest airport via radarvirtuel.com API
 #               4. Register station via /api/station/register
 #               5. Launch socat Beast pipe → radarvirtuel.com:30004
+# v1.4 : fix Cloudflare 403 — User-Agent navigateur sur tous les appels API
 # ─────────────────────────────────────────────────────────────
 
 import os
@@ -23,9 +24,32 @@ RV_REGISTER = 'https://radarvirtuel.com/api/station/register'
 UID_FILE    = '/data/station_uid.txt'
 RV_HOST     = 'radarvirtuel.com'
 RV_PORT     = '30004'
+UA          = 'Mozilla/5.0 (compatible; RadarVirtuel-feeder/1.4)'
 
 def log(msg):
     print(f"[RV] {msg}", flush=True)
+
+def api_get(url):
+    """HTTP GET avec User-Agent navigateur pour passer Cloudflare."""
+    req = urllib.request.Request(url, headers={'User-Agent': UA})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode())
+
+def api_post(url, payload_dict, uid):
+    """HTTP POST JSON avec User-Agent navigateur."""
+    payload = json.dumps(payload_dict).encode('utf-8')
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            'Content-Type':  'application/json',
+            'X-Station-UID': uid,
+            'User-Agent':    UA,
+        },
+        method='POST'
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
 
 # ── Station UID ───────────────────────────────────────────────
 # Priority 1 : RV_STATION_UID env var
@@ -33,12 +57,10 @@ def log(msg):
 # Priority 3 : persisted UUID in Docker volume /data/station_uid.txt
 # Priority 4 : generate new UUID and persist it
 def get_or_create_uid():
-    # 1 — env var
     env_uid = os.environ.get('RV_STATION_UID', '').strip()
     if env_uid and len(env_uid) >= 8:
         log(f"UID from environment: {env_uid}")
         return env_uid
-    # 2 — CPU serial du host
     try:
         with open('/host/cpuinfo') as f:
             for line in f:
@@ -49,14 +71,12 @@ def get_or_create_uid():
                         return serial
     except Exception:
         pass
-    # 3 — fichier persisté dans volume Docker
     os.makedirs('/data', exist_ok=True)
     if os.path.exists(UID_FILE):
         uid = open(UID_FILE).read().strip()
         if uid and len(uid) >= 8:
             log(f"UID loaded from {UID_FILE}: {uid}")
             return uid
-    # 4 — générer un UUID et le persister
     uid = uuid.uuid4().hex
     open(UID_FILE, 'w').write(uid)
     log(f"UID generated: {uid} → saved to {UID_FILE}")
@@ -69,7 +89,6 @@ def get_coords():
     lat = os.environ.get('RV_LAT', '').strip()
     lon = os.environ.get('RV_LON', '').strip()
     alt = os.environ.get('RV_ALT_M', '0').strip()
-    # Fallback : lire mlat-client si monté
     if not lat or not lon:
         try:
             with open('/etc/default/mlat-client') as f:
@@ -98,9 +117,8 @@ def get_coords():
 def get_nearest_airport(lat, lon):
     """API response: {"airports": [{icao_code, name, distance_km, suggested_label}]}"""
     try:
-        url = f"https://radarvirtuel.com/api/nearest_airport?lat={lat}&lon={lon}"
-        with urllib.request.urlopen(url, timeout=10) as r:
-            data = json.loads(r.read().decode())
+        url  = f"https://radarvirtuel.com/api/nearest_airport?lat={lat}&lon={lon}"
+        data = api_get(url)
         airports = data.get('airports', [])
         if airports:
             first     = airports[0]
@@ -128,29 +146,17 @@ def get_station_label(suggested_label):
 
 # ── Register station ──────────────────────────────────────────
 def register_station(uid, label, lat, lon, alt_m):
-    payload = json.dumps({
-        'station_uid':   uid,
-        'station_label': label,
-        'lat':           lat,
-        'lon':           lon,
-        'alt_m':         alt_m,
-        'contrib_name':  os.environ.get('RV_CONTRIB_NAME', ''),
-        'contrib_email': os.environ.get('RV_CONTRIB_EMAIL', ''),
-        'description':   f"Docker feeder — {label}",
-    }).encode('utf-8')
-    req = urllib.request.Request(
-        RV_REGISTER,
-        data=payload,
-        headers={
-            'Content-Type':  'application/json',
-            'X-Station-UID': uid,
-            'User-Agent':    'docker-radarvirtuel/2.0'
-        },
-        method='POST'
-    )
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            resp = json.loads(r.read().decode())
+        resp = api_post(RV_REGISTER, {
+            'station_uid':   uid,
+            'station_label': label,
+            'lat':           lat,
+            'lon':           lon,
+            'alt_m':         alt_m,
+            'contrib_name':  os.environ.get('RV_CONTRIB_NAME', ''),
+            'contrib_email': os.environ.get('RV_CONTRIB_EMAIL', ''),
+            'description':   f"Docker feeder — {label}",
+        }, uid)
         status = resp.get('status', '?').upper()
         actual = resp.get('station_label', label)
         log(f"Registration: {status} — station {actual} uid={uid}")
@@ -181,16 +187,16 @@ def launch_connector(source_host, source_port, label, lat, lon):
 # ── Main ──────────────────────────────────────────────────────
 def main():
     log("=" * 50)
-    log("RadarVirtuel Docker Feeder v1.3 — 2026-06-08")
+    log("RadarVirtuel Docker Feeder v1.4 — 2026-06-08")
     log("=" * 50)
 
-    uid              = get_or_create_uid()
-    lat, lon, alt_m  = get_coords()
+    uid             = get_or_create_uid()
+    lat, lon, alt_m = get_coords()
     log(f"Position: lat={lat} lon={lon} alt={alt_m}m")
 
-    suggested, _     = get_nearest_airport(lat, lon)
-    label            = get_station_label(suggested)
-    _, label         = register_station(uid, label, lat, lon, alt_m)
+    suggested, _    = get_nearest_airport(lat, lon)
+    label           = get_station_label(suggested)
+    _, label        = register_station(uid, label, lat, lon, alt_m)
 
     source      = os.environ.get('SOURCE_HOST', 'localhost:30005')
     parts       = source.rsplit(':', 1)
