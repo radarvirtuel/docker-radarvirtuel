@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ─────────────────────────────────────────────────────────────
 # File        : docker-entrypoint.py
-# Version     : v1.6 — 2026-06-08
+# Version     : v1.7 — 2026-06-08
 # Deploy      : /entrypoint.py (inside Docker image)
 # Description : RadarVirtuel Docker feeder entrypoint
 #               1. Station UID — CPU serial host > volume > UUID généré
@@ -11,8 +11,8 @@
 #               4. Register station via /api/station/register
 #               5. Heartbeat thread — POST /api/station/feed_ping toutes les 60s
 #               6. Launch socat en subprocess (garde le thread heartbeat actif)
+# v1.7 : RV_HOST lu depuis env — IP directe par défaut (bypass Cloudflare)
 # v1.6 : fix — socat lancé en subprocess.Popen au lieu de os.execvp
-#              pour que le thread heartbeat reste actif
 # ─────────────────────────────────────────────────────────────
 
 import os
@@ -28,9 +28,9 @@ import time
 RV_REGISTER  = 'https://radarvirtuel.com/api/station/register'
 RV_FEED_PING = 'https://radarvirtuel.com/api/station/feed_ping'
 UID_FILE     = '/data/station_uid.txt'
-RV_HOST      = 'radarvirtuel.com'
+RV_HOST      = os.environ.get('RV_HOST', '65.108.133.247')
 RV_PORT      = '30004'
-UA           = 'Mozilla/5.0 (compatible; RadarVirtuel-feeder/1.6)'
+UA           = 'Mozilla/5.0 (compatible; RadarVirtuel-feeder/1.7)'
 
 def log(msg):
     print(f"[RV] {msg}", flush=True)
@@ -54,7 +54,6 @@ def api_post(url, payload_dict, uid):
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode())
 
-# ── Station UID ───────────────────────────────────────────────
 def get_or_create_uid():
     env_uid = os.environ.get('RV_STATION_UID', '').strip()
     if env_uid and len(env_uid) >= 8:
@@ -81,7 +80,6 @@ def get_or_create_uid():
     log(f"UID generated: {uid} → saved to {UID_FILE}")
     return uid
 
-# ── Coordinates ───────────────────────────────────────────────
 def get_coords():
     lat = os.environ.get('RV_LAT', '').strip()
     lon = os.environ.get('RV_LON', '').strip()
@@ -110,7 +108,6 @@ def get_coords():
         log(f"ERROR: Invalid coordinates: lat={lat} lon={lon}")
         sys.exit(1)
 
-# ── Nearest airport ───────────────────────────────────────────
 def get_nearest_airport(lat, lon):
     try:
         data     = api_get(f"https://radarvirtuel.com/api/nearest_airport?lat={lat}&lon={lon}")
@@ -127,7 +124,6 @@ def get_nearest_airport(lat, lon):
         log(f"Warning: nearest_airport API: {e}")
     return None, {}
 
-# ── Station label ─────────────────────────────────────────────
 def get_station_label(suggested_label):
     label = os.environ.get('RV_STATION_LABEL', '').strip().upper()
     if label:
@@ -139,7 +135,6 @@ def get_station_label(suggested_label):
     log(f"Label auto-selected: {suggested_label}")
     return suggested_label
 
-# ── Register station ──────────────────────────────────────────
 def register_station(uid, label, lat, lon, alt_m):
     try:
         resp = api_post(RV_REGISTER, {
@@ -164,9 +159,7 @@ def register_station(uid, label, lat, lon, alt_m):
         log(f"Registration warning: {e} — continuing")
         return True, label
 
-# ── Heartbeat thread ──────────────────────────────────────────
 def heartbeat_loop(uid, label, interval=60):
-    """POST /api/station/feed_ping toutes les 60s — maintient le statut ONLINE."""
     log(f"Heartbeat started — ping every {interval}s")
     while True:
         time.sleep(interval)
@@ -179,9 +172,7 @@ def heartbeat_loop(uid, label, interval=60):
         except Exception as e:
             log(f"Heartbeat error: {e}")
 
-# ── Launch socat Beast pipe ───────────────────────────────────
 def launch_connector(source_host, source_port, label, lat, lon):
-    """socat TCP pipe en subprocess — garde le thread heartbeat actif."""
     cmd = [
         'socat',
         f'TCP:{source_host}:{source_port},retry=60,interval=5',
@@ -192,18 +183,15 @@ def launch_connector(source_host, source_port, label, lat, lon):
     log(f"  Target : {RV_HOST}:{RV_PORT}")
     log(f"  Station: {label} lat={lat} lon={lon}")
     log("─" * 50)
-    # subprocess.Popen — ne remplace pas le process Python
-    # Le thread heartbeat continue de tourner
     while True:
         proc = subprocess.Popen(cmd)
         ret  = proc.wait()
         log(f"socat exited (code {ret}) — restarting in 5s")
         time.sleep(5)
 
-# ── Main ──────────────────────────────────────────────────────
 def main():
     log("=" * 50)
-    log("RadarVirtuel Docker Feeder v1.6 — 2026-06-08")
+    log("RadarVirtuel Docker Feeder v1.7 — 2026-06-08")
     log("=" * 50)
 
     uid             = get_or_create_uid()
@@ -214,7 +202,6 @@ def main():
     label           = get_station_label(suggested)
     _, label        = register_station(uid, label, lat, lon, alt_m)
 
-    # Heartbeat thread daemon
     threading.Thread(
         target=heartbeat_loop, args=(uid, label, 60), daemon=True
     ).start()
