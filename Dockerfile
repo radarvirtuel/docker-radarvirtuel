@@ -4,10 +4,15 @@
 # Description : RadarVirtuel Docker feeder
 #               Beast TCP pipe via socat
 #               SOURCE_HOST:30005 → radarvirtuel.com:30004
+#               Base: python:3.11-slim-bookworm (no s6-overlay)
 # ─────────────────────────────────────────────────────────────
 FROM python:3.11-slim-bookworm
 
 LABEL maintainer="laurent.duval@adsbnetwork.com"
+LABEL org.opencontainers.image.title="docker-radarvirtuel v2"
+LABEL org.opencontainers.image.description="RadarVirtuel ADS-B feeder — Beast TCP pipe"
+LABEL org.opencontainers.image.url="https://radarvirtuel.com"
+LABEL org.opencontainers.image.version="2.0"
 
 RUN apt-get update -q && \
     apt-get install -y --no-install-recommends \
