@@ -1,9 +1,9 @@
 # ─────────────────────────────────────────────────────────────
 # Dockerfile — docker-radarvirtuel v2
-# Version     : v1.2 — 2026-06-08
+# Version     : v1.3 — 2026-06-08
 # Description : RadarVirtuel Docker feeder
-#               Beast TCP input → radarvirtuel.com:30004
-#               Base: python:3.11-slim + readsb from sdr-enthusiasts repo
+#               Beast TCP pipe via socat
+#               SOURCE_HOST:30005 → radarvirtuel.com:30004
 # ─────────────────────────────────────────────────────────────
 FROM python:3.11-slim-bookworm
 
@@ -11,16 +11,8 @@ LABEL maintainer="laurent.duval@adsbnetwork.com"
 
 RUN apt-get update -q && \
     apt-get install -y --no-install-recommends \
-        curl \
-        ca-certificates \
-        gnupg \
+        socat \
         netcat-openbsd && \
-    curl -fsSL https://pkg.sdr-enthusiasts.com/repo/apt/sdr-e.gpg \
-        | gpg --dearmor -o /usr/share/keyrings/sdr-e.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/sdr-e.gpg] https://pkg.sdr-enthusiasts.com/repo/apt bookworm main" \
-        > /etc/apt/sources.list.d/sdr-e.list && \
-    apt-get update -q && \
-    apt-get install -y --no-install-recommends readsb && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /data
