@@ -231,9 +231,33 @@ def heartbeat_loop(uid, label, interval=60):
         except Exception as e:
             log(f"Heartbeat error: {e}")
 
+# ── Patch AIRCRAFT_SOURCES dans feeder_radarvirtuel.py ───────
+def patch_feeder_sources():
+    """Remplace localhost par RV_AIRCRAFT_URL dans AIRCRAFT_SOURCES du feeder."""
+    aircraft_url = os.environ.get('RV_AIRCRAFT_URL', '').strip()
+    if not aircraft_url or 'localhost' in aircraft_url or '127.0.0.1' in aircraft_url:
+        return  # Pas besoin de patch si localhost ou non défini
+    feeder_path = '/opt/feeder_rv/feeder_radarvirtuel.py'
+    try:
+        with open(feeder_path) as f:
+            src = f.read()
+        # Insérer RV_AIRCRAFT_URL en tête de AIRCRAFT_SOURCES
+        old = "AIRCRAFT_SOURCES = ["
+        new = f"AIRCRAFT_SOURCES = [\n    '{aircraft_url}',"
+        if aircraft_url not in src:
+            src = src.replace(old, new)
+            with open(feeder_path, 'w') as f:
+                f.write(src)
+            log(f"Feeder patched — aircraft URL: {aircraft_url}")
+        else:
+            log(f"Feeder already patched — aircraft URL: {aircraft_url}")
+    except Exception as e:
+        log(f"Warning: cannot patch feeder sources: {e}")
+
 # ── Launch feeder_radarvirtuel.py ─────────────────────────────
 def launch_feeder():
     """Lance feeder_radarvirtuel.py en subprocess avec restart automatique."""
+    patch_feeder_sources()
     cmd = ['python3', '-u', '/opt/feeder_rv/feeder_radarvirtuel.py']
     log(f"Launching feeder_radarvirtuel.py...")
     log("─" * 50)

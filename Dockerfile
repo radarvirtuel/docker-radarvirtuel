@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────
 # Dockerfile — docker-radarvirtuel v2.0
-# Version     : v2.0 — 2026-06-08
+# Version     : v2.1 — 2026-06-08
 # Description : RadarVirtuel Docker feeder v2.0
 #               feeder_radarvirtuel.py — POST /api/feed avec tagging station
 #               Base: python:3.11-slim-bookworm
@@ -15,8 +15,8 @@ LABEL org.opencontainers.image.version="2.0"
 
 RUN apt-get update -q && \
     apt-get install -y --no-install-recommends \
-        python3-requests \
         netcat-openbsd && \
+    pip install --no-cache-dir requests && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /data /opt/feeder_rv
