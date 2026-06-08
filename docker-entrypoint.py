@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ─────────────────────────────────────────────────────────────
 # File        : docker-entrypoint.py
-# Version     : v1.0 — 2026-06-08
+# Version     : v1.1 — 2026-06-08
 # Deploy      : /entrypoint.py (inside Docker image)
 # Description : RadarVirtuel Docker feeder entrypoint
 #               1. Get or generate station UID (persisted in /data)
@@ -63,46 +63,39 @@ def get_coords():
 
 # ── Nearest airport ───────────────────────────────────────────
 def get_nearest_airport(lat, lon):
-    """Query radarvirtuel.com to find nearest airport — same logic as install_feeder_universal.sh"""
+    """Query radarvirtuel.com to find nearest airport.
+    API response: {"airports": [{icao_code, name, distance_km, suggested_label, ...}], "count": N}
+    Returns (suggested_label, airport_dict) or (None, {}).
+    """
     try:
         url = f"https://radarvirtuel.com/api/nearest_airport?lat={lat}&lon={lon}"
         with urllib.request.urlopen(url, timeout=10) as r:
             data = json.loads(r.read().decode())
-        icao = data.get('icao_code', '')
-        name = data.get('name', '')
-        dist = data.get('distance_km', 0)
-        if icao:
-            log(f"Nearest airport: {icao} — {name} ({dist:.1f} km)")
-            return icao, data
+        airports = data.get('airports', [])
+        if airports:
+            first     = airports[0]
+            icao      = first.get('icao_code', '')
+            name      = first.get('name', '')
+            dist      = first.get('distance_km', 0)
+            suggested = first.get('suggested_label', f"{icao}1")
+            log(f"Nearest airport: {icao} — {name} ({dist:.1f} km) → suggested: {suggested}")
+            return suggested, first
     except Exception as e:
         log(f"Warning: cannot reach nearest_airport API: {e}")
     return None, {}
 
 # ── Station label ─────────────────────────────────────────────
-def get_station_label(nearest_icao):
-    """Use provided label or derive from nearest airport — add suffix if taken."""
+def get_station_label(suggested_label):
+    """Use RV_STATION_LABEL from env, or use suggested_label returned by API."""
     label = os.environ.get('RV_STATION_LABEL', '').strip().upper()
     if label:
+        log(f"Label from environment: {label}")
         return label
-    if not nearest_icao:
+    if not suggested_label:
         log("ERROR: RV_STATION_LABEL must be set (no nearest airport found)")
         sys.exit(1)
-    # Try ICAO1, ICAO2, ICAO3...
-    base = nearest_icao[:4]
-    for suffix in range(1, 10):
-        candidate = f"{base}{suffix}"
-        try:
-            url = f"https://radarvirtuel.com/api/station/check_label?label={candidate}"
-            with urllib.request.urlopen(url, timeout=8) as r:
-                resp = json.loads(r.read().decode())
-            if resp.get('available'):
-                log(f"Label selected: {candidate}")
-                return candidate
-        except Exception:
-            # API not available — use ICAO1 as default
-            log(f"Label check unavailable — using {base}1")
-            return f"{base}1"
-    return f"{base}1"
+    log(f"Label auto-selected: {suggested_label}")
+    return suggested_label
 
 # ── Register station ──────────────────────────────────────────
 def register_station(uid, label, lat, lon, alt_m):
@@ -136,7 +129,6 @@ def register_station(uid, label, lat, lon, alt_m):
     except urllib.error.HTTPError as e:
         body = e.read().decode('utf-8', errors='replace')
         log(f"Registration HTTP {e.code}: {body[:200]}")
-        # Continue anyway — station may already exist
         return True, label
     except Exception as e:
         log(f"Registration warning: {e} — continuing")
@@ -166,7 +158,7 @@ def launch_connector(source_host, source_port, label, lat, lon, alt_m):
     log(f"  Target : {RV_HOST}:{RV_PORT} (Beast out)")
     log(f"  Station: {label} lat={lat} lon={lon}")
     log("─" * 50)
-    os.execvp('readsb', cmd)   # replace process — readsb takes over
+    os.execvp('readsb', cmd)
 
 # ── Main ──────────────────────────────────────────────────────
 def main():
@@ -174,29 +166,19 @@ def main():
     log("RadarVirtuel Docker Feeder v2.0 — 2026-06-08")
     log("=" * 50)
 
-    # 1 — UID
     uid = get_or_create_uid()
-
-    # 2 — Coordinates
     lat, lon, alt_m = get_coords()
     log(f"Position: lat={lat} lon={lon} alt={alt_m}m")
 
-    # 3 — Nearest airport
-    nearest_icao, airport_data = get_nearest_airport(lat, lon)
-
-    # 4 — Station label
-    label = get_station_label(nearest_icao)
-
-    # 5 — Register
+    suggested, airport_data = get_nearest_airport(lat, lon)
+    label = get_station_label(suggested)
     ok, label = register_station(uid, label, lat, lon, alt_m)
 
-    # 6 — Source Beast host
     source = os.environ.get('SOURCE_HOST', f"{os.environ.get('HOSTNAME', 'localhost')}:30005")
     parts  = source.rsplit(':', 1)
     source_host = parts[0]
     source_port = parts[1] if len(parts) == 2 else '30005'
 
-    # 7 — Launch
     launch_connector(source_host, source_port, label, lat, lon, alt_m)
 
 if __name__ == '__main__':
